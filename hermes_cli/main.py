@@ -9358,6 +9358,54 @@ def main():
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
+    # gateway weixin
+    gateway_weixin = gateway_subparsers.add_parser(
+        "weixin",
+        help="Manage Weixin gateway headless binding",
+        description="Create and control Weixin gateway QR binding sessions without interactive prompts.",
+    )
+    gateway_weixin_subparsers = gateway_weixin.add_subparsers(dest="weixin_command")
+    gateway_weixin_create = gateway_weixin_subparsers.add_parser(
+        "create-session",
+        help="Create a Weixin QR binding session",
+    )
+    gateway_weixin_create.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Write machine-readable JSON to stdout",
+    )
+    gateway_weixin_create.add_argument(
+        "--bot-type",
+        default="3",
+        help="iLink bot_type to request (default: 3)",
+    )
+
+    gateway_weixin_status = gateway_weixin_subparsers.add_parser(
+        "session-status",
+        help="Poll a Weixin QR binding session",
+    )
+    gateway_weixin_status.add_argument("session_id", help="Hermes local Weixin binding session ID")
+    gateway_weixin_status.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Write machine-readable JSON to stdout",
+    )
+
+    for _name, _help in [
+        ("start", "Start the Weixin gateway"),
+        ("stop", "Stop the Weixin gateway"),
+        ("unbind", "Remove local Weixin gateway credentials"),
+    ]:
+        _parser = gateway_weixin_subparsers.add_parser(_name, help=_help)
+        _parser.add_argument(
+            "--json",
+            action="store_true",
+            required=True,
+            help="Write machine-readable JSON to stdout",
+        )
+
     # gateway migrate-legacy
     gateway_migrate_legacy = gateway_subparsers.add_parser(
         "migrate-legacy",

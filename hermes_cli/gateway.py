@@ -5,6 +5,8 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import contextlib
+import json
 import os
 import shutil
 import signal
@@ -4988,6 +4990,200 @@ def gateway_command(args):
         sys.exit(1)
 
 
+def _print_json(payload):
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _weixin_headless_account_id(hermes_home: str) -> str | None:
+    account_dir = Path(hermes_home) / "weixin" / "accounts"
+    if not account_dir.exists():
+        return None
+    for path in sorted(account_dir.glob("*.json")):
+        if path.name.endswith((".context-tokens.json", ".sync.json")):
+            continue
+        return path.stem
+    return None
+
+
+def _weixin_headless_result(
+    status: str,
+    *,
+    gateway_account_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+):
+    return {
+        "status": status,
+        "gateway_account_id": gateway_account_id,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def _remove_weixin_env_values(hermes_home: str) -> None:
+    env_path = Path(hermes_home) / ".env"
+    if not env_path.exists():
+        return
+    remove_keys = {
+        "WEIXIN_ACCOUNT_ID",
+        "WEIXIN_TOKEN",
+        "WEIXIN_BASE_URL",
+        "WEIXIN_CDN_BASE_URL",
+    }
+    kept_lines = []
+    for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key not in remove_keys:
+            kept_lines.append(line)
+    env_path.write_text(("\n".join(kept_lines) + "\n") if kept_lines else "", encoding="utf-8")
+    for key in remove_keys:
+        os.environ.pop(key, None)
+
+
+def _start_detached_gateway_process(hermes_home: str) -> None:
+    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+    log_dir = Path(hermes_home) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_dir / "gateway.log", "ab")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = hermes_home
+    env["HERMES_GATEWAY_DETACHED"] = "1"
+    command = [get_python_path(), "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            close_fds=True,
+            **windows_detach_popen_kwargs(),
+        )
+    finally:
+        log_file.close()
+
+
+def _call_with_stdout_to_stderr(func, *args, **kwargs):
+    with contextlib.redirect_stdout(sys.stderr):
+        return func(*args, **kwargs)
+
+
+def _gateway_weixin_command(args):
+    subcmd = getattr(args, "weixin_command", None)
+    as_json = bool(getattr(args, "json", False))
+    if not as_json:
+        print("Weixin headless gateway commands require --json")
+        sys.exit(2)
+
+    hermes_home = str(get_hermes_home())
+    if subcmd == "create-session":
+        from gateway.platforms.weixin import create_weixin_headless_session
+
+        payload = asyncio.run(
+            create_weixin_headless_session(
+                hermes_home,
+                bot_type=str(getattr(args, "bot_type", "3")),
+            )
+        )
+        _print_json(payload)
+        return
+
+    if subcmd == "session-status":
+        from gateway.platforms.weixin import get_weixin_headless_session_status
+
+        payload = asyncio.run(
+            get_weixin_headless_session_status(
+                hermes_home,
+                str(getattr(args, "session_id", "")),
+            )
+        )
+        _print_json(payload)
+        return
+
+    if subcmd == "start":
+        account_id = _weixin_headless_account_id(hermes_home)
+        if not account_id:
+            _print_json(_weixin_headless_result(
+                "failed",
+                error_code="missing_credentials",
+                error_message="Weixin account credentials were not found",
+            ))
+            return
+        snapshot = get_gateway_runtime_snapshot()
+        if not snapshot.running:
+            try:
+                if supports_systemd_services():
+                    _call_with_stdout_to_stderr(systemd_start, system=False)
+                elif is_macos():
+                    _call_with_stdout_to_stderr(launchd_start)
+                elif is_windows():
+                    from hermes_cli import gateway_windows
+                    _call_with_stdout_to_stderr(gateway_windows.start)
+                else:
+                    _start_detached_gateway_process(hermes_home)
+            except SystemExit as exc:
+                if exc.code not in (0, None):
+                    raise
+            except Exception as exc:
+                _print_json(_weixin_headless_result(
+                    "failed",
+                    gateway_account_id=account_id,
+                    error_code="gateway_start_failed",
+                    error_message=str(exc),
+                ))
+                return
+        _print_json(_weixin_headless_result("running", gateway_account_id=account_id))
+        return
+
+    if subcmd == "stop":
+        account_id = _weixin_headless_account_id(hermes_home)
+        try:
+            stopped = stop_profile_gateway()
+        except Exception as exc:
+            _print_json(_weixin_headless_result(
+                "failed",
+                gateway_account_id=account_id,
+                error_code="gateway_stop_failed",
+                error_message=str(exc),
+            ))
+            return
+        _print_json(_weixin_headless_result(
+            "stopped",
+            gateway_account_id=account_id,
+            error_message=None if stopped else "No gateway running for this profile",
+        ))
+        return
+
+    if subcmd == "unbind":
+        account_id = _weixin_headless_account_id(hermes_home)
+        try:
+            stop_profile_gateway()
+            weixin_root = Path(hermes_home) / "weixin"
+            for directory_name in ("accounts", "sessions"):
+                directory = weixin_root / directory_name
+                if directory.exists():
+                    for path in directory.glob("*.json"):
+                        path.unlink()
+            active_path = weixin_root / "active-session.json"
+            if active_path.exists():
+                active_path.unlink()
+            _remove_weixin_env_values(hermes_home)
+        except Exception as exc:
+            _print_json(_weixin_headless_result(
+                "failed",
+                gateway_account_id=account_id,
+                error_code="weixin_unbind_failed",
+                error_message=str(exc),
+            ))
+            return
+        _print_json(_weixin_headless_result("unbound"))
+        return
+
+    print("Unknown Weixin gateway command")
+    sys.exit(2)
+
+
 def _gateway_command_inner(args):
     subcmd = getattr(args, 'gateway_command', None)
     
@@ -5001,6 +5197,10 @@ def _gateway_command_inner(args):
 
     if subcmd == "setup":
         gateway_setup()
+        return
+
+    if subcmd == "weixin":
+        _gateway_weixin_command(args)
         return
 
     # Service management commands

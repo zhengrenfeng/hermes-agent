@@ -1,8 +1,10 @@
 """Tests for hermes_cli.gateway."""
 
+import json
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch, call
+from unittest.mock import AsyncMock, patch, call
 
 import pytest
 
@@ -266,6 +268,266 @@ def test_gateway_start_in_container_with_operational_systemd_uses_systemd(monkey
     gateway.gateway_command(args)
 
     assert calls == [False]
+
+
+class TestGatewayWeixinHeadlessCli:
+    def test_weixin_headless_commands_are_registered_in_argparse(self):
+        commands = [
+            ["gateway", "weixin", "create-session", "--help"],
+            ["gateway", "weixin", "session-status", "--help"],
+            ["gateway", "weixin", "start", "--help"],
+            ["gateway", "weixin", "stop", "--help"],
+            ["gateway", "weixin", "unbind", "--help"],
+        ]
+
+        for argv in commands:
+            result = subprocess.run(
+                [sys.executable, "-m", "hermes_cli.main", *argv],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode == 0, (
+                f"argv={argv!r} returned {result.returncode}\n"
+                f"stdout: {result.stdout[:300]}\n"
+                f"stderr: {result.stderr[:300]}"
+            )
+            assert "unrecognized arguments" not in result.stderr
+
+    def test_weixin_create_session_json_outputs_machine_json(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: "/tmp/hermes-home")
+        create_mock = AsyncMock(
+            return_value={
+                "session_id": "local-session-1",
+                "status": "qr_ready",
+                "qr_code_base64": "base64-image",
+                "qr_expires_at": "2026-05-10T12:00:00+00:00",
+                "gateway_account_id": None,
+                "error_code": None,
+                "error_message": None,
+            }
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.weixin.create_weixin_headless_session",
+            create_mock,
+        )
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="create-session",
+            json=True,
+            bot_type="3",
+        )
+
+        gateway.gateway_command(args)
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["status"] == "qr_ready"
+        assert payload["session_id"] == "local-session-1"
+        assert captured.err == ""
+        create_mock.assert_awaited_once_with("/tmp/hermes-home", bot_type="3")
+
+    def test_weixin_session_status_json_outputs_machine_json_without_token(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: "/tmp/hermes-home")
+        status_mock = AsyncMock(
+            return_value={
+                "session_id": "local-session-1",
+                "status": "confirmed",
+                "qr_code_base64": None,
+                "qr_expires_at": None,
+                "gateway_account_id": "a5ace6fd482e@im.bot",
+                "error_code": None,
+                "error_message": None,
+            }
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.weixin.get_weixin_headless_session_status",
+            status_mock,
+        )
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="session-status",
+            session_id="local-session-1",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["status"] == "confirmed"
+        assert payload["gateway_account_id"] == "a5ace6fd482e@im.bot"
+        assert "token" not in payload
+        assert "token" not in captured.out.lower()
+        status_mock.assert_awaited_once_with("/tmp/hermes-home", "local-session-1")
+
+    def test_weixin_start_json_returns_running_for_saved_account(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        account_dir = tmp_path / "weixin" / "accounts"
+        account_dir.mkdir(parents=True)
+        (account_dir / "a5ace6fd482e@im.bot.json").write_text(
+            json.dumps({"token": "secret-weixin-token"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            gateway,
+            "get_gateway_runtime_snapshot",
+            lambda: SimpleNamespace(running=True),
+        )
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="start",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "status": "running",
+            "gateway_account_id": "a5ace6fd482e@im.bot",
+            "error_code": None,
+            "error_message": None,
+        }
+
+    def test_weixin_start_json_spawns_detached_gateway_when_no_service(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        account_dir = tmp_path / "weixin" / "accounts"
+        account_dir.mkdir(parents=True)
+        (account_dir / "a5ace6fd482e@im.bot.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            gateway,
+            "get_gateway_runtime_snapshot",
+            lambda: SimpleNamespace(running=False),
+        )
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
+        popen_calls = []
+        monkeypatch.setattr(gateway.subprocess, "Popen", lambda *args, **kwargs: popen_calls.append((args, kwargs)))
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="start",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "running"
+        assert payload["gateway_account_id"] == "a5ace6fd482e@im.bot"
+        assert len(popen_calls) == 1
+        command = popen_calls[0][0][0]
+        assert command[-3:] == ["gateway", "run", "--replace"]
+        assert popen_calls[0][1]["stdin"] == subprocess.DEVNULL
+
+    def test_weixin_start_json_keeps_service_output_off_stdout(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        account_dir = tmp_path / "weixin" / "accounts"
+        account_dir.mkdir(parents=True)
+        (account_dir / "a5ace6fd482e@im.bot.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            gateway,
+            "get_gateway_runtime_snapshot",
+            lambda: SimpleNamespace(running=False),
+        )
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway, "systemd_start", lambda system=False: print("human service output"))
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="start",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["status"] == "running"
+        assert captured.out.count("{") == 1
+        assert "human service output" not in captured.out
+        assert "human service output" in captured.err
+
+    def test_weixin_stop_json_uses_profile_stop(self, monkeypatch, tmp_path, capsys):
+        account_dir = tmp_path / "weixin" / "accounts"
+        account_dir.mkdir(parents=True)
+        (account_dir / "a5ace6fd482e@im.bot.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: str(tmp_path))
+        stop_calls = []
+        monkeypatch.setattr(gateway, "stop_profile_gateway", lambda: stop_calls.append(True) or True)
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="stop",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "stopped"
+        assert payload["gateway_account_id"] == "a5ace6fd482e@im.bot"
+        assert stop_calls == [True]
+
+    def test_weixin_unbind_json_removes_local_accounts_and_sessions(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        account_dir = tmp_path / "weixin" / "accounts"
+        session_dir = tmp_path / "weixin" / "sessions"
+        account_dir.mkdir(parents=True)
+        session_dir.mkdir(parents=True)
+        (account_dir / "a5ace6fd482e@im.bot.json").write_text(
+            json.dumps({"token": "secret-weixin-token"}),
+            encoding="utf-8",
+        )
+        (session_dir / "local-session-1.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "weixin" / "active-session.json").write_text("{}", encoding="utf-8")
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                [
+                    "WEIXIN_ACCOUNT_ID=a5ace6fd482e@im.bot",
+                    "WEIXIN_TOKEN=secret-weixin-token",
+                    "WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com",
+                    "OTHER_KEY=kept",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(gateway, "stop_profile_gateway", lambda: True)
+
+        args = SimpleNamespace(
+            gateway_command="weixin",
+            weixin_command="unbind",
+            json=True,
+        )
+
+        gateway.gateway_command(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unbound"
+        assert not list(account_dir.glob("*.json"))
+        assert not list(session_dir.glob("*.json"))
+        assert not (tmp_path / "weixin" / "active-session.json").exists()
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "WEIXIN_ACCOUNT_ID" not in env_text
+        assert "WEIXIN_TOKEN" not in env_text
+        assert "WEIXIN_BASE_URL" not in env_text
+        assert "OTHER_KEY=kept" in env_text
 
 
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):

@@ -4,7 +4,9 @@ import asyncio
 import base64
 import json
 import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -330,6 +332,153 @@ class TestWeixinQrLogin:
 
         assert result is None
         assert api_get_mock.await_count == 2
+
+
+class TestWeixinHeadlessSession:
+    def test_create_weixin_headless_session_returns_qr_ready_payload(self, tmp_path, monkeypatch):
+        qr_response = {
+            "qrcode": "qr-token-1",
+            "qrcode_img_content": "https://example.com/qr-token-1",
+        }
+        png_bytes = b"\x89PNG\r\n\x1a\nfake-png"
+
+        class FakeImage:
+            def save(self, buffer, format):
+                assert format == "PNG"
+                buffer.write(png_bytes)
+
+        class FakeQrCode:
+            def __init__(self):
+                self.data = None
+
+            def add_data(self, data):
+                self.data = data
+
+            def make(self, fit=True):
+                assert fit is True
+
+            def make_image(self, fill_color, back_color):
+                assert self.data == "https://example.com/qr-token-1"
+                assert fill_color == "black"
+                assert back_color == "white"
+                return FakeImage()
+
+        monkeypatch.setitem(sys.modules, "qrcode", SimpleNamespace(QRCode=FakeQrCode))
+
+        with patch("gateway.platforms.weixin._api_get", new_callable=AsyncMock) as api_get_mock, \
+             patch("gateway.platforms.weixin.AIOHTTP_AVAILABLE", True), \
+             patch(
+                 "gateway.platforms.weixin.aiohttp",
+                 SimpleNamespace(ClientSession=Mock(), TCPConnector=Mock()),
+             ) as fake_aiohttp:
+            api_get_mock.return_value = qr_response
+            session = AsyncMock()
+            session.__aenter__.return_value = session
+            session.__aexit__.return_value = False
+            fake_aiohttp.ClientSession.return_value = session
+
+            payload = asyncio.run(weixin.create_weixin_headless_session(str(tmp_path)))
+
+        assert payload["session_id"]
+        assert payload["status"] == "qr_ready"
+        assert payload["qr_code_base64"]
+        assert payload["qr_expires_at"]
+        assert payload["gateway_account_id"] is None
+        assert payload["error_message"] is None
+        assert payload["error_code"] is None
+        assert base64.b64decode(payload["qr_code_base64"]) == png_bytes
+
+        stored = weixin.load_weixin_binding_session(str(tmp_path), payload["session_id"])
+        assert stored["session_id"] == payload["session_id"]
+        assert stored["qrcode"] == "qr-token-1"
+        assert stored["status"] == "qr_ready"
+
+    def test_create_weixin_headless_session_returns_failed_payload_when_qr_rendering_fails(self, tmp_path, monkeypatch):
+        qr_response = {
+            "qrcode": "qr-token-1",
+            "qrcode_img_content": "https://example.com/qr-token-1",
+        }
+        monkeypatch.setattr(
+            weixin,
+            "_qrcode_png_base64",
+            lambda _scan_data: (_ for _ in ()).throw(RuntimeError("qrcode missing")),
+        )
+
+        with patch("gateway.platforms.weixin._api_get", new_callable=AsyncMock) as api_get_mock, \
+             patch("gateway.platforms.weixin.AIOHTTP_AVAILABLE", True), \
+             patch(
+                 "gateway.platforms.weixin.aiohttp",
+                 SimpleNamespace(ClientSession=Mock(), TCPConnector=Mock()),
+             ) as fake_aiohttp:
+            api_get_mock.return_value = qr_response
+            session = AsyncMock()
+            session.__aenter__.return_value = session
+            session.__aexit__.return_value = False
+            fake_aiohttp.ClientSession.return_value = session
+
+            payload = asyncio.run(weixin.create_weixin_headless_session(str(tmp_path)))
+
+        assert payload["status"] == "failed"
+        assert payload["error_code"] == "qr_render_failed"
+        assert "qrcode missing" in payload["error_message"]
+
+    def test_get_weixin_headless_session_status_saves_confirmed_account_without_returning_token(self, tmp_path):
+        session = {
+            "session_id": "local-session-1",
+            "status": "qr_ready",
+            "qrcode": "qr-token-1",
+            "qr_code_base64": "base64-image",
+            "qr_expires_at": "2026-05-10T12:00:00+00:00",
+            "gateway_account_id": None,
+            "base_url": weixin.ILINK_BASE_URL,
+            "created_at": "2026-05-10T11:55:00+00:00",
+            "updated_at": "2026-05-10T11:55:00+00:00",
+            "error_code": None,
+            "error_message": None,
+        }
+        weixin.save_weixin_binding_session(str(tmp_path), session)
+
+        status_response = {
+            "status": "confirmed",
+            "ilink_bot_id": "a5ace6fd482e@im.bot",
+            "bot_token": "secret-weixin-token",
+            "baseurl": "https://ilinkai.weixin.qq.com",
+            "ilink_user_id": "wxid_user_1",
+        }
+
+        with patch("gateway.platforms.weixin._api_get", new_callable=AsyncMock) as api_get_mock, \
+             patch("gateway.platforms.weixin.AIOHTTP_AVAILABLE", True), \
+             patch(
+                 "gateway.platforms.weixin.aiohttp",
+                 SimpleNamespace(ClientSession=Mock(), TCPConnector=Mock()),
+             ) as fake_aiohttp:
+            api_get_mock.return_value = status_response
+            aiohttp_session = AsyncMock()
+            aiohttp_session.__aenter__.return_value = aiohttp_session
+            aiohttp_session.__aexit__.return_value = False
+            fake_aiohttp.ClientSession.return_value = aiohttp_session
+
+            payload = asyncio.run(
+                weixin.get_weixin_headless_session_status(
+                    str(tmp_path), "local-session-1"
+                )
+            )
+
+        assert payload["status"] == "confirmed"
+        assert payload["gateway_account_id"] == "a5ace6fd482e@im.bot"
+        assert "token" not in payload
+        assert "secret-weixin-token" not in json.dumps(payload)
+
+        account = weixin.load_weixin_account(str(tmp_path), "a5ace6fd482e@im.bot")
+        assert account["token"] == "secret-weixin-token"
+        assert account["base_url"] == "https://ilinkai.weixin.qq.com"
+        assert account["user_id"] == "wxid_user_1"
+
+        env_file = tmp_path / ".env"
+        env_text = env_file.read_text(encoding="utf-8")
+        assert "WEIXIN_ACCOUNT_ID=a5ace6fd482e@im.bot" in env_text
+        assert "WEIXIN_TOKEN=secret-weixin-token" in env_text
+        assert "WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com" in env_text
 
 
 class TestWeixinSendMessageIntegration:

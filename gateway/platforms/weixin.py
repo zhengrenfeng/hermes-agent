@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -26,7 +27,7 @@ import tempfile
 import textwrap
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -94,6 +95,17 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
+WEIXIN_BINDING_STATUSES = {
+    "created",
+    "qr_ready",
+    "scanned",
+    "confirmed",
+    "running",
+    "expired",
+    "cancelled",
+    "failed",
+}
+WEIXIN_QR_EXPIRES_SECONDS = 480
 
 
 def _is_stale_session_ret(
@@ -254,6 +266,67 @@ def save_weixin_account(
         pass
 
 
+def _save_env_value(hermes_home: str, key: str, value: str) -> None:
+    """Persist a single Hermes .env value without importing CLI setup code."""
+    if not value:
+        return
+    env_path = Path(hermes_home) / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_value = str(value).replace("\n", "").replace("\r", "")
+    lines: List[str] = []
+    if env_path.exists():
+        try:
+            lines = env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        except OSError:
+            lines = []
+
+    replacement = f"{key}={clean_value}"
+    found = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith(f"{key}="):
+            lines[index] = replacement
+            found = True
+            break
+    if not found:
+        lines.append(replacement)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(env_path.parent),
+        prefix=".env_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, env_path)
+        try:
+            env_path.chmod(0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _save_weixin_account_env(
+    hermes_home: str,
+    *,
+    account_id: str,
+    token: str,
+    base_url: str,
+) -> None:
+    _save_env_value(hermes_home, "WEIXIN_ACCOUNT_ID", account_id)
+    _save_env_value(hermes_home, "WEIXIN_TOKEN", token)
+    _save_env_value(hermes_home, "WEIXIN_BASE_URL", base_url)
+    _save_env_value(hermes_home, "WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+
+
 def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str, Any]]:
     """Load persisted account credentials."""
     path = _account_file(hermes_home, account_id)
@@ -263,6 +336,280 @@ def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str,
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _weixin_binding_session_dir(hermes_home: str) -> Path:
+    path = Path(hermes_home) / "weixin" / "sessions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _weixin_binding_session_file(hermes_home: str, session_id: str) -> Path:
+    safe_session_id = Path(str(session_id)).name
+    return _weixin_binding_session_dir(hermes_home) / f"{safe_session_id}.json"
+
+
+def _weixin_active_session_file(hermes_home: str) -> Path:
+    return Path(hermes_home) / "weixin" / "active-session.json"
+
+
+def save_weixin_binding_session(hermes_home: str, session: Dict[str, Any]) -> None:
+    """Persist a headless Weixin QR binding session."""
+    payload = dict(session)
+    payload["updated_at"] = _utc_now_iso()
+    path = _weixin_binding_session_file(hermes_home, str(payload["session_id"]))
+    atomic_json_write(path, payload)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    if payload.get("status") in {"created", "qr_ready", "scanned", "confirmed", "running"}:
+        active_path = _weixin_active_session_file(hermes_home)
+        atomic_json_write(active_path, {"session_id": payload["session_id"]})
+
+
+def load_weixin_binding_session(hermes_home: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """Load a persisted headless Weixin QR binding session."""
+    path = _weixin_binding_session_file(hermes_home, session_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _weixin_binding_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "session_id": session.get("session_id"),
+        "status": session.get("status"),
+        "qr_code_base64": session.get("qr_code_base64"),
+        "qr_expires_at": session.get("qr_expires_at"),
+        "gateway_account_id": session.get("gateway_account_id"),
+        "error_code": session.get("error_code"),
+        "error_message": session.get("error_message"),
+    }
+
+
+def _make_failed_weixin_binding_payload(
+    *,
+    session_id: Optional[str] = None,
+    error_code: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    return {
+        "session_id": session_id or f"weixin-{uuid.uuid4().hex}",
+        "status": "failed",
+        "qr_code_base64": None,
+        "qr_expires_at": None,
+        "gateway_account_id": None,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def _qrcode_png_base64(scan_data: str) -> str:
+    try:
+        import qrcode
+    except Exception as exc:
+        raise RuntimeError("qrcode is required for Weixin headless QR generation") from exc
+
+    qr = qrcode.QRCode()
+    qr.add_data(scan_data)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _map_weixin_qr_status(status: str) -> str:
+    if status == "scaned":
+        return "scanned"
+    if status == "scaned_but_redirect":
+        return "scanned"
+    if status in WEIXIN_BINDING_STATUSES:
+        return status
+    return "qr_ready"
+
+
+async def create_weixin_headless_session(
+    hermes_home: str,
+    *,
+    bot_type: str = "3",
+) -> Dict[str, Any]:
+    """Create a non-interactive Weixin QR binding session."""
+    if not AIOHTTP_AVAILABLE:
+        return _make_failed_weixin_binding_payload(
+            error_code="missing_dependency",
+            error_message="aiohttp is required for Weixin QR login",
+        )
+
+    session_id = f"weixin-{uuid.uuid4().hex}"
+    try:
+        async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+            qr_resp = await _api_get(
+                session,
+                base_url=ILINK_BASE_URL,
+                endpoint=f"{EP_GET_BOT_QR}?bot_type={bot_type}",
+                timeout_ms=QR_TIMEOUT_MS,
+            )
+    except Exception as exc:
+        logger.warning("weixin: failed to create headless QR session: %s", exc)
+        failed = _make_failed_weixin_binding_payload(
+            session_id=session_id,
+            error_code="ilink_api_error",
+            error_message=f"iLink QR request failed: {exc}",
+        )
+        save_weixin_binding_session(hermes_home, failed)
+        return failed
+
+    qrcode_value = str(qr_resp.get("qrcode") or "")
+    qrcode_url = str(qr_resp.get("qrcode_img_content") or "")
+    if not qrcode_value:
+        failed = _make_failed_weixin_binding_payload(
+            session_id=session_id,
+            error_code="invalid_ilink_response",
+            error_message="iLink QR response missing qrcode",
+        )
+        save_weixin_binding_session(hermes_home, failed)
+        return failed
+
+    qr_scan_data = qrcode_url if qrcode_url else qrcode_value
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    try:
+        qr_code_base64 = _qrcode_png_base64(qr_scan_data)
+    except Exception as exc:
+        failed = _make_failed_weixin_binding_payload(
+            session_id=session_id,
+            error_code="qr_render_failed",
+            error_message=f"Weixin QR rendering failed: {exc}",
+        )
+        save_weixin_binding_session(hermes_home, failed)
+        return failed
+
+    payload = {
+        "session_id": session_id,
+        "status": "qr_ready",
+        "qrcode": qrcode_value,
+        "qr_code_base64": qr_code_base64,
+        "qr_expires_at": (now + timedelta(seconds=WEIXIN_QR_EXPIRES_SECONDS)).isoformat(),
+        "gateway_account_id": None,
+        "base_url": ILINK_BASE_URL,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "error_code": None,
+        "error_message": None,
+    }
+    save_weixin_binding_session(hermes_home, payload)
+    return _weixin_binding_response(payload)
+
+
+async def get_weixin_headless_session_status(
+    hermes_home: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    """Poll and update a non-interactive Weixin QR binding session."""
+    session_state = load_weixin_binding_session(hermes_home, session_id)
+    if not session_state:
+        return _make_failed_weixin_binding_payload(
+            session_id=session_id,
+            error_code="session_not_found",
+            error_message="Weixin binding session was not found",
+        )
+    if session_state.get("status") in {"confirmed", "running", "expired", "cancelled", "failed"}:
+        return _weixin_binding_response(session_state)
+    if not AIOHTTP_AVAILABLE:
+        session_state.update({
+            "status": "failed",
+            "error_code": "missing_dependency",
+            "error_message": "aiohttp is required for Weixin QR login",
+        })
+        save_weixin_binding_session(hermes_home, session_state)
+        return _weixin_binding_response(session_state)
+
+    qrcode_value = str(session_state.get("qrcode") or "")
+    if not qrcode_value:
+        session_state.update({
+            "status": "failed",
+            "error_code": "invalid_session",
+            "error_message": "Weixin binding session is missing qrcode",
+        })
+        save_weixin_binding_session(hermes_home, session_state)
+        return _weixin_binding_response(session_state)
+
+    base_url = str(session_state.get("base_url") or ILINK_BASE_URL)
+    try:
+        async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+            status_resp = await _api_get(
+                session,
+                base_url=base_url,
+                endpoint=f"{EP_GET_QR_STATUS}?qrcode={qrcode_value}",
+                timeout_ms=QR_TIMEOUT_MS,
+            )
+    except Exception as exc:
+        logger.warning("weixin: failed to poll headless QR session %s: %s", _safe_id(session_id), exc)
+        session_state.update({
+            "status": "failed",
+            "error_code": "ilink_api_error",
+            "error_message": f"iLink QR status request failed: {exc}",
+        })
+        save_weixin_binding_session(hermes_home, session_state)
+        return _weixin_binding_response(session_state)
+
+    status = str(status_resp.get("status") or "wait")
+    mapped_status = _map_weixin_qr_status(status)
+    if status == "scaned_but_redirect":
+        redirect_host = str(status_resp.get("redirect_host") or "")
+        if redirect_host:
+            session_state["base_url"] = f"https://{redirect_host}"
+
+    session_state["status"] = mapped_status
+    if mapped_status == "confirmed":
+        account_id = str(status_resp.get("ilink_bot_id") or "")
+        token = str(status_resp.get("bot_token") or "")
+        account_base_url = str(status_resp.get("baseurl") or session_state.get("base_url") or ILINK_BASE_URL)
+        user_id = str(status_resp.get("ilink_user_id") or "")
+        if not account_id or not token:
+            session_state.update({
+                "status": "failed",
+                "error_code": "invalid_ilink_response",
+                "error_message": "iLink confirmed QR without account credentials",
+            })
+        else:
+            save_weixin_account(
+                hermes_home,
+                account_id=account_id,
+                token=token,
+                base_url=account_base_url,
+                user_id=user_id,
+            )
+            _save_weixin_account_env(
+                hermes_home,
+                account_id=account_id,
+                token=token,
+                base_url=account_base_url,
+            )
+            session_state["gateway_account_id"] = account_id
+            session_state["qr_code_base64"] = None
+            session_state["qr_expires_at"] = None
+            session_state["error_code"] = None
+            session_state["error_message"] = None
+    elif mapped_status == "expired":
+        session_state["qr_code_base64"] = None
+        session_state["error_code"] = "qr_expired"
+        session_state["error_message"] = "Weixin QR code expired"
+    else:
+        session_state["error_code"] = None
+        session_state["error_message"] = None
+
+    save_weixin_binding_session(hermes_home, session_state)
+    return _weixin_binding_response(session_state)
 
 
 class ContextTokenStore:
