@@ -5029,6 +5029,9 @@ def _remove_weixin_env_values(hermes_home: str) -> None:
         "WEIXIN_TOKEN",
         "WEIXIN_BASE_URL",
         "WEIXIN_CDN_BASE_URL",
+        "WEIXIN_HOME_CHANNEL",
+        "WEIXIN_HOME_CHANNEL_NAME",
+        "WEIXIN_HOME_CHANNEL_THREAD_ID",
     }
     kept_lines = []
     for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():

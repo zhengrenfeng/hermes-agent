@@ -501,6 +501,9 @@ class TestGatewayWeixinHeadlessCli:
                     "WEIXIN_ACCOUNT_ID=a5ace6fd482e@im.bot",
                     "WEIXIN_TOKEN=secret-weixin-token",
                     "WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com",
+                    "WEIXIN_HOME_CHANNEL=wxid_user_1",
+                    "WEIXIN_HOME_CHANNEL_NAME=Primary DM",
+                    "WEIXIN_HOME_CHANNEL_THREAD_ID=thread-1",
                     "OTHER_KEY=kept",
                 ]
             )
@@ -527,6 +530,9 @@ class TestGatewayWeixinHeadlessCli:
         assert "WEIXIN_ACCOUNT_ID" not in env_text
         assert "WEIXIN_TOKEN" not in env_text
         assert "WEIXIN_BASE_URL" not in env_text
+        assert "WEIXIN_HOME_CHANNEL" not in env_text
+        assert "WEIXIN_HOME_CHANNEL_NAME" not in env_text
+        assert "WEIXIN_HOME_CHANNEL_THREAD_ID" not in env_text
         assert "OTHER_KEY=kept" in env_text
 
 
