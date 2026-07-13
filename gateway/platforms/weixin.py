@@ -424,7 +424,7 @@ def _qrcode_png_base64(scan_data: str) -> str:
     qr.make(fit=True)
     image = qr.make_image(fill_color="black", back_color="white")
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    image.save(buffer)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 

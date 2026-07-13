@@ -343,8 +343,7 @@ class TestWeixinHeadlessSession:
         png_bytes = b"\x89PNG\r\n\x1a\nfake-png"
 
         class FakeImage:
-            def save(self, buffer, format):
-                assert format == "PNG"
+            def save(self, buffer):
                 buffer.write(png_bytes)
 
         class FakeQrCode:
