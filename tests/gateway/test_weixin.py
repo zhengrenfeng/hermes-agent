@@ -478,6 +478,22 @@ class TestWeixinHeadlessSession:
         assert "WEIXIN_ACCOUNT_ID=a5ace6fd482e@im.bot" in env_text
         assert "WEIXIN_TOKEN=secret-weixin-token" in env_text
         assert "WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com" in env_text
+        assert "WEIXIN_HOME_CHANNEL=wxid_user_1" in env_text
+        assert "user_id" not in payload
+        assert "wxid_user_1" not in json.dumps(payload)
+
+    def test_save_weixin_account_env_omits_home_channel_without_user_id(self, tmp_path):
+        weixin._save_weixin_account_env(
+            str(tmp_path),
+            account_id="a5ace6fd482e@im.bot",
+            token="secret-weixin-token",
+            base_url="https://ilinkai.weixin.qq.com",
+            user_id="",
+        )
+
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "WEIXIN_ACCOUNT_ID=a5ace6fd482e@im.bot" in env_text
+        assert "WEIXIN_HOME_CHANNEL" not in env_text
 
 
 class TestWeixinSendMessageIntegration:

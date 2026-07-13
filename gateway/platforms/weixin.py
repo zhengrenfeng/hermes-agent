@@ -320,11 +320,14 @@ def _save_weixin_account_env(
     account_id: str,
     token: str,
     base_url: str,
+    user_id: str = "",
 ) -> None:
     _save_env_value(hermes_home, "WEIXIN_ACCOUNT_ID", account_id)
     _save_env_value(hermes_home, "WEIXIN_TOKEN", token)
     _save_env_value(hermes_home, "WEIXIN_BASE_URL", base_url)
     _save_env_value(hermes_home, "WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+    if user_id:
+        _save_env_value(hermes_home, "WEIXIN_HOME_CHANNEL", user_id)
 
 
 def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str, Any]]:
@@ -594,6 +597,7 @@ async def get_weixin_headless_session_status(
                 account_id=account_id,
                 token=token,
                 base_url=account_base_url,
+                user_id=user_id,
             )
             session_state["gateway_account_id"] = account_id
             session_state["qr_code_base64"] = None
